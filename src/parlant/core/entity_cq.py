@@ -237,8 +237,9 @@ class EntityQueries:
     async def find_events(
         self,
         session_id: SessionId,
+        min_offset: int | None = None,
     ) -> Sequence[Event]:
-        return await self._session_store.list_events(session_id)
+        return await self._session_store.list_events(session_id, min_offset=min_offset)
 
     async def find_guideline_tool_associations(
         self,

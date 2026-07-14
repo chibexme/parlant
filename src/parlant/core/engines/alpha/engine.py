@@ -15,7 +15,8 @@
 from __future__ import annotations
 import asyncio
 import copy
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
+from cachetools import TTLCache
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -30,7 +31,7 @@ from typing_extensions import override
 from parlant.core import async_utils
 from parlant.core.agents import Agent, AgentId, CompositionMode
 from parlant.core.capabilities import Capability
-from parlant.core.common import Criticality, JSONSerializable
+from parlant.core.common import Criticality, DefaultBaseModel, JSONSerializable
 from parlant.core.context_variables import (
     ContextVariable,
     ContextVariableValue,
@@ -49,6 +50,9 @@ from parlant.core.engines.alpha.hooks import EngineHooks
 from parlant.core.engines.alpha.perceived_performance_policy import (
     PerceivedPerformancePolicyProvider,
 )
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
+from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
+from parlant.core.nlp.service import NLPService
 from parlant.core.engines.alpha.planners import Plan, PlannerProvider
 from parlant.core.engines.alpha.relational_resolver import RelationalResolver
 from parlant.core.engines.alpha.tool_calling.tool_caller import (
@@ -139,6 +143,10 @@ class _MessageGeneration:
     messages: Sequence[str | None]
 
 
+class SummarizationSchema(DefaultBaseModel):
+    summary: str
+
+
 class AlphaEngine(Engine):
     """The main AI processing engine (as of Feb 25, the latest and greatest processing engine)"""
 
@@ -158,6 +166,8 @@ class AlphaEngine(Engine):
         perceived_performance_policy_provider: PerceivedPerformancePolicyProvider,
         planner_provider: PlannerProvider,
         hooks: EngineHooks,
+        nlp_service: NLPService,
+        optimization_policy: OptimizationPolicy,
     ) -> None:
         self._logger = logger
         self._tracer = tracer
@@ -176,6 +186,12 @@ class AlphaEngine(Engine):
 
         self._planner_provider = planner_provider
         self._hooks = hooks
+
+        self._nlp_service = nlp_service
+        self._optimization_policy = optimization_policy
+        self._summarization_locks: TTLCache[str, asyncio.Lock] = TTLCache(
+            maxsize=1024, ttl=300
+        )
 
         self._hist_engine_process_duration = self._meter.create_duration_histogram(
             name="eng.process",
@@ -288,8 +304,12 @@ class AlphaEngine(Engine):
             )
             raise
 
-    async def _load_interaction_state(self, context: Context) -> Interaction:
-        history = await self._entity_queries.find_events(context.session_id)
+    async def _load_interaction_state(self, context: Context, session: Session) -> Interaction:
+        if self._optimization_policy.use_history_summarization():
+            min_offset = int(session.metadata.get("summary_offset", 0))
+        else:
+            min_offset = 0
+        history = await self._entity_queries.find_events(context.session_id, min_offset=min_offset)
 
         return Interaction(
             events=history,
@@ -399,6 +419,7 @@ class AlphaEngine(Engine):
                 await self._call_journey_handlers(context, self._hooks.on_journey_message_handlers)
 
             await async_utils.latched_shield(uncancellable_section)
+            self._trigger_summarization_if_needed(context)
 
         except asyncio.CancelledError:
             # Task was cancelled. This usually happens for 1 of 2 reasons:
@@ -437,6 +458,7 @@ class AlphaEngine(Engine):
                 _ = await self._generate_messages(context, latch)
 
             await async_utils.latched_shield(uncancellable_section)
+            self._trigger_summarization_if_needed(context)
 
         except asyncio.CancelledError:
             self._logger.warning("Uttering cancelled")
@@ -458,7 +480,7 @@ class AlphaEngine(Engine):
         customer = await self._entity_queries.read_customer(session.customer_id)
 
         if load_interaction:
-            interaction = await self._load_interaction_state(context)
+            interaction = await self._load_interaction_state(context, session)
         else:
             interaction = Interaction([])
 
@@ -496,6 +518,80 @@ class AlphaEngine(Engine):
         EntityContext.set(result)
 
         return result
+
+    def _trigger_summarization_if_needed(self, context: EngineContext) -> None:
+        if not self._optimization_policy.use_history_summarization():
+            return
+
+        asyncio.create_task(self._summarize_history(context.session.id))
+
+    async def _summarize_history(self, session_id: str) -> None:
+        lock = self._summarization_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._summarization_locks[session_id] = lock
+
+        async with lock:
+            try:
+                session = await self._entity_queries.read_session(session_id)
+                summary_offset = int(session.metadata.get("summary_offset", 0))
+                
+                # Fetch all events from summary_offset
+                events = await self._entity_queries.find_events(session_id, min_offset=summary_offset)
+                
+                threshold = self._optimization_policy.get_summarization_threshold_events()
+                if len(events) < threshold:
+                    return
+                    
+                max_history = self._optimization_policy.get_max_history_events()
+                num_to_summarize = len(events) - max_history
+                if num_to_summarize <= 0:
+                    return
+                    
+                events_to_summarize = events[:num_to_summarize]
+                last_summarized_event = events_to_summarize[-1]
+                last_summarized_offset = last_summarized_event.offset
+                
+                old_summary = session.metadata.get("summary", "")
+                
+                events_str = "\n".join(
+                    PromptBuilder.adapt_event(e)
+                    for e in events_to_summarize
+                )
+                
+                generator = await self._nlp_service.get_schematic_generator(
+                    SummarizationSchema
+                )
+                
+                prompt = f"""
+    You are tasked with maintaining a running summary of a customer service chat session.
+    
+    Previous Summary:
+    {old_summary or 'No previous summary.'}
+    
+    New events to merge into the summary:
+    {events_str}
+    
+    Please generate an updated running summary of the conversation. Keep it concise.
+    Preserve crucial context such as names, order IDs, specific user preferences, and unresolved requests.
+    """
+                result = await generator.generate(prompt=prompt)
+                new_summary = result.content.summary
+                
+                metadata = dict(session.metadata)
+                metadata["summary"] = new_summary
+                metadata["summary_offset"] = last_summarized_offset + 1
+                
+                await self._entity_commands.update_session(
+                    session_id=session_id,
+                    params=SessionUpdateParamsModel(
+                        metadata=metadata
+                    )
+                )
+                self._logger.info(f"Session {session_id} history summarized successfully up to offset {last_summarized_offset}")
+            except Exception as e:
+                self._logger.error(f"Failed to summarize history for session {session_id}: {e}")
+
 
     async def _initialize_response_state(
         self,
@@ -1852,6 +1948,10 @@ class AlphaEngine(Engine):
         if context.interaction.events:
             query += str([e.data for e in context.interaction.events])
 
+        summary = context.session.metadata.get("summary")
+        if summary:
+            query += f"\nSummary: {summary}"
+
         if query:
             return await self._entity_queries.find_capabilities_for_agent(
                 agent_id=context.agent.id,
@@ -1888,6 +1988,10 @@ class AlphaEngine(Engine):
         if context.state.tool_events:
             query += str([e.data for e in context.state.tool_events])
 
+        summary = context.session.metadata.get("summary")
+        if summary:
+            query += f"\nSummary: {summary}"
+
         if query:
             return await self._entity_queries.find_glossary_terms_for_context(
                 agent_id=context.agent.id,
@@ -1915,6 +2019,10 @@ class AlphaEngine(Engine):
 
         if context.interaction.events:
             query += str([e.data for e in context.interaction.events])
+
+        summary = context.session.metadata.get("summary")
+        if summary:
+            query += f"\nSummary: {summary}"
 
         if query:
             return list(

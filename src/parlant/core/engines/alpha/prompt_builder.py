@@ -60,6 +60,7 @@ class BuiltInSection(str, Enum):
 
     AGENT_IDENTITY = auto()
     CUSTOMER_IDENTITY = auto()
+    CONVERSATION_SUMMARY = auto()
     INTERACTION_HISTORY = auto()
     CONTEXT_VARIABLES = auto()
     GLOSSARY = auto()
@@ -378,6 +379,25 @@ Proceed with your task accordingly.
         else:
             self._add_empty_history_section()
 
+        return self
+
+    def add_conversation_summary(
+        self,
+        summary: str,
+    ) -> PromptBuilder:
+        if summary:
+            self.add_section(
+                name=BuiltInSection.CONVERSATION_SUMMARY,
+                template="""
+CONVERSATION SUMMARY:
+--------------------
+Here is a summary of the earlier part of the conversation: ###
+{summary}
+###
+""",
+                props={"summary": summary},
+                status=SectionStatus.ACTIVE,
+            )
         return self
 
     def add_context_variables(

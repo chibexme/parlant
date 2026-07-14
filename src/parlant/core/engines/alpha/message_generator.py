@@ -365,6 +365,10 @@ Later in this prompt, you'll be provided with behavioral guidelines and other co
 
         builder.add_agent_identity(agent)
         builder.add_customer_identity(customer, session)
+        if self._optimization_policy.use_history_summarization():
+            summary = session.metadata.get("summary")
+            if summary:
+                builder.add_conversation_summary(summary)
         builder.add_section(
             name="message-generator-task-description",
             template="""

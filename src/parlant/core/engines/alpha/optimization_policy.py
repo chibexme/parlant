@@ -61,6 +61,30 @@ class OptimizationPolicy(ABC):
         """Gets the retry temperatures (and number of generation attempts) for guideline propositions."""
         ...
 
+    @abstractmethod
+    def use_history_summarization(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> bool:
+        """Determines whether to use session history summarization and windowing."""
+        ...
+
+    @abstractmethod
+    def get_summarization_threshold_events(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> int:
+        """Gets the threshold event count that triggers summarization."""
+        ...
+
+    @abstractmethod
+    def get_max_history_events(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> int:
+        """Gets the maximum number of recent events to keep in context (the sliding window size)."""
+        ...
+
 
 class BasicOptimizationPolicy(OptimizationPolicy):
     """A basic optimization policy that defines default behaviors for the engine."""
@@ -163,3 +187,24 @@ class BasicOptimizationPolicy(OptimizationPolicy):
             0.15,
             0.1,
         ]
+
+    @override
+    def use_history_summarization(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> bool:
+        return True
+
+    @override
+    def get_summarization_threshold_events(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> int:
+        return 20
+
+    @override
+    def get_max_history_events(
+        self,
+        hints: Mapping[str, Any] = {},
+    ) -> int:
+        return 10
